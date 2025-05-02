@@ -27,7 +27,7 @@ from typing import List
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any  # Add this with other imports
 import spacy
-
+from fastapi.staticfiles import StaticFiles
 # -----------------------------
 # Configuration & Constants
 # -----------------------------
@@ -168,10 +168,8 @@ async def get_all_metadata_for_tfidf(db_path):
             async with db.execute("SELECT faiss_id, sentence_hash, file, sentence FROM metadata ORDER BY faiss_id") as cursor:
                  async for row in cursor:
                     results.append({
-                        "faiss_id": row[0],
-                        "sentence_hash": row[1],
-                        "file": row[2], 
-                        "sentence": row[3]
+                        "faiss_id": row[0], "sentence_hash": row[1],
+                        "file": row[2], "sentence": row[3]
                     })
     except Exception as e:
         logger.error(f"Error fetching all metadata for TF-IDF: {e}")
@@ -791,7 +789,7 @@ class KeywordSearcher:
                         # If text is valid, proceed to create the result dictionary
                         # Use .get() for other fields for robustness
                         results.append({
-                            'text': item['sentence'], # Use the validated, non-empty text
+                            'text': item['sentence_text'], # Use the validated, non-empty text
                             'source': item.get('file', 'Unknown'),
                             'sentence_hash': item.get('sentence_hash', 'N/A'),
                             'faiss_id': item.get('faiss_id', -1),
@@ -1087,104 +1085,78 @@ def apply_feedback(current_score, feedback_data, query, sentence_hash):
      else:
          return current_score
 
+
 async def hybrid_search(session, query, retriever, keyword_searcher, api_key, endpoint, db_path, top_k=10, rerank_with_llm=True):
     """Performs hybrid search combining vector and keyword results, with optional LLM re-ranking."""
-    
-    # 1. Retrieve from both sources with validation
+
+    # 1. Retrieve from both sources concurrently
     logger.info("Performing hybrid retrieval...")
-    
-    # Fetch results from both sources
-    vector_task = asyncio.create_task(retriever.retrieve(query, top_k=top_k * 2))
+    vector_task = asyncio.create_task(retriever.retrieve(query, top_k=top_k * 2)) # Fetch more candidates initially
+    # Keyword search is synchronous currently, run in executor if it becomes slow
     loop = asyncio.get_running_loop()
     keyword_results = await loop.run_in_executor(None, keyword_searcher.search, query, top_k * 2)
     vector_results = await vector_task
+    logger.info(f"Retrieved {len(vector_results)} vector results and {len(keyword_results)} keyword results.")
 
-    # Validate base results
-    vector_results = [item for item in vector_results 
-                     if all(k in item for k in ("text", "sentence_hash"))]
-    keyword_results = [item for item in keyword_results 
-                      if all(k in item for k in ("text", "sentence_hash"))]
 
-    logger.info(f"Validated results: {len(vector_results)} vector, {len(keyword_results)} keyword")
+    # 2. Normalize scores (handle cases with no results)
+    vec_scores_norm = normalize_scores(vector_results, key="score") if vector_results else []
+    kwd_scores_norm = normalize_scores(keyword_results, key="score") if keyword_results else []
 
-    # 2. Normalize scores
-    vec_scores_norm = normalize_scores(vector_results, "score") if vector_results else []
-    kwd_scores_norm = normalize_scores(keyword_results, "score") if keyword_results else []
-
-    # 3. Combine using RRF with safe key access
+    # 3. Combine using Reciprocal Rank Fusion (RRF)
     combined = defaultdict(lambda: {'score': 0.0, 'sources': set()})
 
     # Process vector results
-    for rank, (item, _) in enumerate(zip(vector_results, vec_scores_norm)):
-        key = item.get("sentence_hash")
-        if not key:
-            continue
-        combined[key].update({
-            'text': item.get("text", ""),
-            'source': item.get("source", "Unknown"),
-            'sentence_hash': key,
-            'faiss_id': item.get("faiss_id", -1)
-        })
+    for rank, (item, norm_score) in enumerate(zip(vector_results, vec_scores_norm)):
+        key = item['sentence_hash']
         combined[key]['score'] += reciprocal_rank_fusion(rank)
+        combined[key].update({k: v for k, v in item.items() if k != 'score'}) # Update metadata, keep fused score
         combined[key]['sources'].add('vector')
 
-    # Process keyword results 
-    for rank, (item, _) in enumerate(zip(keyword_results, kwd_scores_norm)):
-        key = item.get("sentence_hash")
-        if not key:
-            continue
-        combined[key].update({
-            'text': item.get("text", ""),
-            'source': item.get("source", "Unknown"), 
-            'sentence_hash': key,
-            'faiss_id': item.get("faiss_id", -1)
-        })
+
+    # Process keyword results
+    for rank, (item, norm_score) in enumerate(zip(keyword_results, kwd_scores_norm)):
+        key = item['sentence_hash']
         combined[key]['score'] += reciprocal_rank_fusion(rank)
+        if key not in combined: # Add metadata if not seen in vector results
+             combined[key].update({k: v for k, v in item.items() if k != 'score'})
         combined[key]['sources'].add('keyword')
 
-    # 4. Final validation before LLM processing
-    fused_results = []
-    for item in combined.values():
-        if all(k in item for k in ("text", "sentence_hash", "source")):
-            item['sources'] = list(item['sources'])
-            fused_results.append(item)
-            
-    fused_results = sorted(fused_results, key=lambda x: x['score'], reverse=True)[:top_k * 2]
-    logger.info(f"Valid fused results: {len(fused_results)}")
 
-    # 5. LLM Re-ranking with enhanced validation
+    # 4. Sort fused results and take top_k
+    # Convert sources set to list for JSON serialization if needed later
+    for key in combined:
+        combined[key]['sources'] = list(combined[key]['sources'])
+
+    fused_results = sorted(combined.values(), key=lambda x: x['score'], reverse=True)[:top_k * 2] # Keep more for re-ranking
+    logger.info(f"Fused results count: {len(fused_results)}")
+
+
+    # 5. LLM Re-ranking (Optional)
     if rerank_with_llm and api_key and endpoint:
         logger.info("Starting LLM re-ranking...")
-        
-        # Validate candidates before processing
-        valid_candidates = [
-            item for item in fused_results
-            if item.get("text") and item.get("sentence_hash")
-        ]
-        
-        reranked = await score_relevance_with_llm(
-            session, query, valid_candidates, 
-            api_key, endpoint, db_path
-        )
-        
-        # Generate justifications only for valid items
-        final_results = []
-        for item in reranked[:top_k]:
-            if not all(k in item for k in ("text", "sentence_hash")):
-                continue
-            try:
-                justification = await rag_generation_hybrid(
-                    session, query, item, api_key, endpoint
-                )
-                item['justification'] = justification
-                final_results.append(item)
-            except Exception as e:
-                logger.error(f"Justification failed for {item.get('sentence_hash')}: {str(e)}")
-        
-        logger.info(f"Returning {len(final_results)} validated results")
-        return final_results
+        # Ensure session is passed correctly
+        reranked_candidates = await score_relevance_with_llm(session, query, fused_results, api_key, endpoint, db_path)
+        logger.info(f"LLM re-ranking complete. Candidates count: {len(reranked_candidates)}")
 
-    return fused_results[:top_k]
+        # Generate justifications concurrently for the final top_k
+        final_results = reranked_candidates[:top_k]
+        justification_tasks = [
+            rag_generation_hybrid(session, query, item, api_key, endpoint)
+            for item in final_results
+        ]
+        if justification_tasks:
+             logger.info(f"Generating {len(justification_tasks)} justifications...")
+             justifications = await tqdm.gather(*justification_tasks, desc="📝 Generating Justifications")
+             logger.info("Justification generation complete.")
+             for item, justification in zip(final_results, justifications):
+                 item['justification'] = justification
+        return final_results
+    else:
+        logger.info("Skipping LLM re-ranking.")
+        # Return fused results directly if not re-ranking
+        return fused_results[:top_k]
+
 
 def display_results_with_feedback(results, query):
     """Interactive result display with feedback collection."""
@@ -1380,6 +1352,7 @@ async def api_status():
         "model": DEFAULT_MODEL
     }
 
+app.mount("/resumes", StaticFiles(directory="resumes"), name="resumes")
 
 # -----------------------------
 # Main Asynchronous Function

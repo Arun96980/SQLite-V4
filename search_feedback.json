@@ -10,4 +10,3 @@
 {"query": "plsql developers", "sentence_hash": "609332cc7bbf366157c51531a44b0e40c2236f16", "is_relevant": true, "timestamp": "2025-04-14T11:35:42.032915"}
 {"query": "hadoop developers", "sentence_hash": "7f48d508f2cb213c245240c502aa05f479cf9437", "is_relevant": true, "timestamp": "2025-04-14T12:11:20.625482"}
 {"query": "python devs", "sentence_hash": "8b5f1012b3f7f9c477c561db622347232f821468", "is_relevant": false, "timestamp": "2025-04-14T12:25:06.059123"}
-{"query": "looking for hadoop developers", "sentence_hash": "034a2c2f300d229ae8e3ae401bdbcc635e495b84", "is_relevant": true, "timestamp": "2025-05-01T22:51:12.223826"}
