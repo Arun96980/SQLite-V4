@@ -1,0 +1,12 @@
+aiohttp
+aiosqlite
+faiss-cpu
+fastapi
+numpy
+pydantic
+scikit-learn
+sentence-transformers
+spacy
+tqdm
+transformers
+uvicorn
